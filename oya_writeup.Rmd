@@ -1,0 +1,248 @@
+---
+title: "OYA Assistance Write Up"
+author: "Joe Mienko"
+date: "Friday, January 30, 2015"
+output: html_document
+---
+
+## The Data
+
+Using a list of fields described in an email from OYA as follows: 
+
+ > Dataset = all individuals who accessed SS, DMAP, MH, AD, CW, FC, OYA or DOC between 2000 and 2013 (CW & FC window is 1998-2010). N=2,621,209
+ 
+ > 1. ID
+ 
+ > 2. Observation time: Days from appearance in dataset (first post-1/1/2000 agency contact) to DOC (for DOC entrants) or to 12/31/13 for non-DOC. 
+ 
+ > 3. DOCEver (Censor variable): 1=entered DOC between 2000 and 2013; 0=did not enter DOC between 2000 and 2013. 6.4% of sample are ‘1’s. It’s possible some ‘0’s entered DOC before 2000. Would take some work to pull them out. Let me know if it’s important.
+ 
+ > 4. Age as of 1/1/2000?
+ 
+ > 5. Age at DOC Entry?
+ 
+ > 6. DOC Entry Year?
+ 
+ > 7. Indicator of SS (or DMAP/MH/AD/CW/FC/OYA) contact BEFORE DOC: (1=Agency contact precedes DOC; 0=After DOC only, or No agency contact)
+  
+ > 8. Age at first post-2000 SS (or DMAP, etc.) episode
+ 
+ > 9. Year of first post-2000 SS (or DMAP, etc.) episode
+ 
+```{r, echo=FALSE}
+library(RODBC)
+library(knitr)
+con <- odbcConnect("POC")
+dat <- sqlQuery(con, "with initial_select as
+                        (
+                        select distinct 
+                          rpe.child ID
+                        	,datediff(dd, min(rpe.removal_dt), iif(min(rp.next_reentry_date) = '9999-12-31', min(rp.next_reentry_date), '2013-12-31')) observation_time 
+                        	,iif(rp.next_reentry_date is null, 0, 1) DOCEver
+                        	,datediff(yy, rp.birthdate, '2000-01-01') + 10 age_at_20000101 
+                        	,datediff(yy, rp.birthdate, rp.next_reentry_date) + 10 age_at_first_DOC_entry
+                        	,year(rp.next_reentry_date) DOC_entry_year
+                        	,iif(rp.tx_braam_race = 'Native American', 1, 0) Indicator_of_SS_prior_to_DOC
+                        	,round((age_at_removal_mos*1.0/12),0,0) + 10 age_at_first_post_2000_SS
+                        	,year(min(rpe.removal_dt)) year_of_first_post_2000_SS
+                        	,rpe.removal_dt ss_start_dt
+                        	,rpe.birthdate bday18 
+                        	,next_reentry_date
+                        from rptPlacement_Events rpe
+                        	join rptPlacement rp
+                        		on rp.child = rpe.child
+                        			and rp.id_removal_episode_fact = rpe.id_removal_episode_fact
+                        group by 
+                        	rpe.child
+                        	,next_reentry_date
+                        	,rp.birthdate
+                        	,rp.tx_braam_race
+                        	,age_at_removal_mos
+                        	,rpe.removal_dt
+                        	,rpe.birthdate 
+                        having 
+                        	min(rpe.removal_dt) between '2000-01-01' and '2013-01-01'
+                        	and datediff(dd, min(rpe.removal_dt), iif(min(rp.next_reentry_date) = '9999-12-31', min(rp.next_reentry_date), '2013-12-31')) < 365.25*14
+                        )
+                        select
+                        	id 
+                        	,min(observation_time) observation_time
+                        	,max(DOCEver) DOCEver
+                        	,age_at_20000101
+                        	,max(age_at_first_DOC_entry) age_at_first_DOC_entry
+                        	,max(DOC_entry_year) DOC_entry_year
+                        	,Indicator_of_SS_prior_to_DOC
+                        	,max(age_at_first_post_2000_SS) age_at_first_post_2000_SS
+                        	,max(year_of_first_post_2000_SS) year_of_first_post_2000_SS
+                        	,min(ss_start_dt) ss_start_dt
+                        	,dateadd(yy, 10, bday18) bday18
+                        	,min(next_reentry_date) DOC_entry_date
+                        from initial_select
+                        group by 
+                        	id 
+                        	,age_at_20000101
+                        	,Indicator_of_SS_prior_to_DOC
+                        	,bday18
+                        having 
+                          (min(ss_start_dt) < min(next_reentry_date) 
+                            or min(next_reentry_date) is null) 
+                          and max(age_at_first_post_2000_SS) >= 18")
+```
+
+This tutorial assumes that we are interested in answering the following basic question: How does a history of social service (SS) system contact impact the risk of contact with the Department of Corrections (DOC)?
+
+The first order of business in this analysis is to identify our population of interest. While many potential populations of interest may exist within this data, I would propose that the most logical starting place would be **adults experiencing their first pre-DOC contact with the SS in Oregon from 2000 through 2013**.
+
+Focusing on this particular population of interest requires a slight subset of the data as described above. In order to subset this data, we assume the existence of two additional fields of data: `ss_start_dt` (a field indicating the precise date in which SS started), `DOC_entry_date` (a field indicating the precise date of DOC entry, sometimes missing), and `bday18` (a field indicating the 18th birthday of the individual in question). In order to properly subset our data, we would select records WHERE `ss_start_dt < DOC_entry_date` OR `DOC_entry_date is null` AND WHERE `age_at_first_post_2000_SS >= 18`.
+
+We assume that the data has been properly subset in the reader's software of choice. The first 10 records of the data would look something like the following:
+
+```{r, echo=FALSE}
+kable(dat[1:10,])
+```
+
+## Running a Survival Analysis in R
+
+Proceeding first with this analysis in the statistical programming language, R, we assume that the data have been loaded into R into an object called `dat`. We next load the `survival` library which gives us our basic event history functions within R. 
+
+```{r, message=FALSE}
+library(survival)
+```
+
+In order to make use of this library, we are going to need to make additional use of the `ss_start_dt` field in our data. This date serves as our 0 value. It is the point at which risk for DOC begins in our population of interest. 
+
+We also make additional use of the `DOC_entry_date` to calculate the time to DOC entry or right-censoring (i.e. the stop of our observation) - whatever comes first. The following chunk of code implements logic to calculate this value and assign the value to a new field of data called `time_from_ss`.
+
+```{r}
+dat$time_from_ss <- ifelse(is.na(dat$DOC_entry_date)
+                             ,difftime(as.Date("2013-12-31")
+                                       ,strptime(dat$ss_start_dt
+                                                 ,"%Y-%m-%d")
+                                       ,units = "days")
+                             ,difftime(strptime(dat$DOC_entry_date
+                                                 ,"%Y-%m-%d")
+                                       ,strptime(dat$ss_start_dt
+                                                ,"%Y-%m-%d")
+                                       ,units = "days")
+                             )
+```
+
+This code may not be entirely readable to non-r users. In essence, the code implements the following logic to calculate `time_from_ss`: IF `DOC_entry_date` is NA, THEN take the difference between `ss_start_dt` and `2013-12-31` ELSE take the difference between `ss_start_dt` and `DOC_entry_date`.
+
+Having calculated this code, we can now use the `survfit()` function within R to calculate the baseline survival curve for our data. We first calculate the survival curve values and assign the values to an object called `surv1`. 
+
+```{r, message=FALSE}
+surv1 <- survfit(Surv(time_from_ss, DOCEver) ~ 1
+        ,dat=dat)
+```
+
+Simply typing the object name returns several pieces of information about `surv1`
+
+```{r, message=FALSE}
+surv1
+```
+
+Of note, we see that no median can be calculated. Plotting the survival curve using the `plot()` function.
+
+```{r, message=FALSE}
+plot(surv1
+     ,conf.int = F
+     ,mark.time = F
+     ,lty=1
+     ,xlab = "Days Since SS"
+     ,ylab = "Probability of Avoiding DOC Involvement")
+
+```
+
+As can be seen, just over 20 percent of the sample is indicated to have contact with DOC by the end of the observation period (i.e. a little under 80 percent of the sample "survived").
+
+We can also stratify the survival curve by `Indicator_of_SS_prior_to_DOC` as shown below. Here, we also make use of the legend function, to add clarity to the plot. 
+
+```{r, message=FALSE}
+surv2 <- survfit(Surv(time_from_ss, DOCEver) ~ Indicator_of_SS_prior_to_DOC
+        ,dat=dat)
+plot(surv2
+     ,conf.int = F
+     ,mark.time = F
+     ,lty=c(1,3)
+     ,xlab = "Days Since SS"
+     ,ylab = "Probability of Avoiding DOC Involvement")
+legend(500
+       ,.4
+       ,c("SS Prior to DOC - No", "SS Prior to DOC - Yes")
+       ,lty=c(1,3)
+       ,bty = "n")
+```
+
+Having observed a difference in survival as a function of SS status, we can run a simple Cox proportion hazards model to estimate the magnitude and significance of the difference. This is accomplished by use of the `coxph()` function as shown below. The results of the `coxph()` algorithm are displayed by way of the `summary()` function as shown below. 
+
+```{r, message=FALSE}
+cox1 <- coxph(Surv(time_from_ss, DOCEver) ~ Indicator_of_SS_prior_to_DOC
+        ,dat=dat)
+summary(cox1)
+```
+
+As can be seen, we observe a significant effect for SS status. Specifically, the results of cox proportional hazards regression indicate that the hazard of DOC involvement is significantly higher (about 39 percent higher) for individuals with a history of SS prior to DOC involvement. 
+
+```{r, message=FALSE, echo=FALSE}
+write.csv(dat, file = "spss_dat.csv")
+```
+
+## Running a Survival Analysis in SPSS
+
+Having completed the analysis in R, we now seek to replicate the analysis in SPSS. The following chunk of syntax should allow the reader to import the csv file available in the GitHub repo into SPSS. The file path, of course, will need to be updated to reflect the working directory on the reader's computer.  
+
+```{}
+GET DATA
+  /TYPE=TXT
+  /FILE="C:\Users\mienkoja\Dropbox\repos\oya_assist\spss_dat.csv"
+  /DELCASE=LINE
+  /DELIMITERS=","
+  /QUALIFIER='"'
+  /ARRANGEMENT=DELIMITED
+  /FIRSTCASE=2
+  /IMPORTCASE=ALL
+  /VARIABLES=
+  V1 F3.0
+  id F5.0
+  observation_time F4.0
+  DOCEver F1.0
+  age_at_20000101 F2.0
+  age_at_first_DOC_entry A2
+  DOC_entry_year A4
+  Indicator_of_SS_prior_to_DOC F1.0
+  age_at_first_post_2000_SS F2.0
+  year_of_first_post_2000_SS F4.0
+  ss_start_dt A10
+  bday18 A10
+  DOC_entry_date A10
+  time_from_ss F16.13.
+CACHE.
+EXECUTE.
+DATASET NAME DataSet5 WINDOW=FRONT.
+```
+
+Having loaded the data into SPSS, the following code should allow the reader to run the identical Cox model in SPSS. 
+
+```{}
+DATASET ACTIVATE DataSet5.
+COXREG time_from_ss
+  /STATUS=DOCEver(1)
+  /METHOD=ENTER Indicator_of_SS_prior_to_DOC 
+  /CRITERIA=PIN(.05) POUT(.10) ITERATE(20).
+```
+
+The relevant output from SPSS is shown below: 
+
+![SPSS Output](spss_out.png)
+
+As can be seen, the $\beta$ indicated in the SPSS output (0.330) is approximately the same as the unexponentiated estimate provided in the R output above (0.33043). 
+
+Thus, while using R for this analysis is recommended due the flexibility provided in the software, the results can clearly be produced using either software package. 
+
+The results here can be expanded to include several additional covariates. Indeed, given the size of the OYA data set, there is no practical limit to the number of covariates that could be included in the model. The results could also be expanded to included different populations of interest. Some candidate populations might include **adults experiencing their first pre-DOC contact with the SS in Oregon as children**, **former DOC inmates experiencing SS on release, and the effects on recidivism**, or **adults experiencing their first pre-DOC contact with the child-serving SS programs**.
+
+
+
+
+
